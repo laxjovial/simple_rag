@@ -1,99 +1,115 @@
+# app_ui.py
+"""
+This script defines the user interface for the Streamlit application.
+It imports functions from app_logic.py to handle all the backend logic.
+"""
+
 import streamlit as st
-import chromadb
-from chromadb.config import Settings
-from sentence_transformers import SentenceTransformer
-from sklearn.manifold import TSNE
-from sklearn.decomposition import PCA
 import plotly.express as px
-from PyPDF2 import PdfReader
-import os
-import uuid
+from app_logic import (
+    initialize_chromadb,
+    extract_chunks_from_pdf,
+    add_documents_to_db,
+    query_db,
+    get_all_data,
+    perform_dimensionality_reduction,
+    cluster_embeddings
+)
 
-# Initialize ChromaDB
-chroma_client = chromadb.PersistentClient(path="./chroma_db")
-collection = chroma_client.get_or_create_collection(name="pdf_chunks")
+# Initialize ChromaDB connection
+collection = initialize_chromadb()
 
-# Sentence transformer model for embeddings
-model = SentenceTransformer("all-MiniLM-L6-v2")
+def main():
+    st.title("🔍 Smart PDF Search Engine (No LLM)")
+    st.write("Upload your documents, search for similar content, and visualize clusters.")
 
-# Helper: Extract and chunk text from PDF
-def extract_chunks(pdf_file):
-    reader = PdfReader(pdf_file)
-    text = ""
-    for page in reader.pages:
-        text += page.extract_text() + "\n"
-    paragraphs = [p.strip() for p in text.split("\n\n") if len(p.strip()) > 30]
-    return paragraphs
+    # --- Upload PDFs section ---
+    st.subheader("📁 Upload PDFs")
+    uploaded_files = st.file_uploader(
+        "Upload PDFs", type="pdf", accept_multiple_files=True
+    )
 
-# Upload PDFs
-st.title("🔍 Smart PDF Search Engine (No LLM)")
-st.write("Upload your documents, search for similar content, and visualize clusters.")
+    if uploaded_files:
+        with st.spinner("Processing and embedding documents..."):
+            for pdf_file in uploaded_files:
+                paragraphs = extract_chunks_from_pdf(pdf_file)
+                add_documents_to_db(collection, pdf_file, paragraphs)
+        st.success("✅ Documents embedded and added successfully!")
 
-uploaded_files = st.file_uploader("📁 Upload PDFs", type="pdf", accept_multiple_files=True)
+    # --- Query Interface section ---
+    st.subheader("🔎 Query Text")
+    query_text = st.text_input("Enter text to search for similar content:")
 
-# Import documents
-if uploaded_files:
-    for pdf_file in uploaded_files:
-        paragraphs = extract_chunks(pdf_file)
-        embeddings = model.encode(paragraphs).tolist()
-        doc_title = pdf_file.name
-        ids = [str(uuid.uuid4()) for _ in range(len(paragraphs))]
-        metadatas = [{"title": doc_title, "chunk": i} for i in range(len(paragraphs))]
-        collection.add(documents=paragraphs, ids=ids, embeddings=embeddings, metadatas=metadatas)
-    st.success("✅ Documents embedded and added successfully!")
-
-# Query interface
-st.subheader("🔎 Query Text")
-query_text = st.text_input("Enter text to search for similar content:")
-
-if query_text:
-    query_embedding = model.encode([query_text]).tolist()
-    results = collection.query(query_embeddings=query_embedding, n_results=5)
-
-    st.markdown("### 🧠 Top Matches:")
-    for doc, meta, dist in zip(results['documents'][0], results['metadatas'][0], results['distances'][0]):
-        st.write(f"**Title:** {meta['title']} | **Chunk:** {meta['chunk']} | **Similarity:** {1 - dist:.2f}")
-        st.info(doc)
-
-# View stored data
-if st.checkbox("📚 View Stored Documents"):
-    data = collection.get()
-    titles = list(set([m['title'] for m in data['metadatas']]))
-    selected_title = st.selectbox("Select Document", options=titles)
-    filtered = [(doc, meta) for doc, meta in zip(data['documents'], data['metadatas']) if meta['title'] == selected_title]
-    for doc, meta in filtered:
-        st.markdown(f"**Chunk {meta['chunk']}**")
-        st.write(doc)
-
-# Cluster visualization
-if st.checkbox("📊 Visualize Clusters"):
-    st.markdown("### ✨ Document Embedding Clusters")
-    data = collection.get()
-    if len(data['embeddings']) < 3:
-        st.warning("Not enough data to visualize.")
-    else:
-        dim_reduce = st.radio("Dimensionality Reduction", ["PCA", "t-SNE"])
-        if dim_reduce == "PCA":
-            reducer = PCA(n_components=2)
+    if query_text:
+        results = query_db(collection, query_text)
+        if results and results['documents']:
+            st.markdown("### 🧠 Top Matches:")
+            for doc, meta, dist in zip(
+                results['documents'][0], results['metadatas'][0], results['distances'][0]
+            ):
+                st.write(
+                    f"**Title:** {meta['title']} | **Chunk:** {meta['chunk']} | **Similarity:** {1 - dist:.2f}"
+                )
+                st.info(doc)
         else:
-            reducer = TSNE(n_components=2, perplexity=5)
+            st.warning("No matches found. Please upload documents first.")
 
-        reduced = reducer.fit_transform(data['embeddings'])
-        df = {
-            "x": reduced[:, 0],
-            "y": reduced[:, 1],
-            "title": [m['title'] for m in data['metadatas']],
-            "chunk": [m['chunk'] for m in data['metadatas']],
-            "text": data['documents']
-        }
+    # --- View Stored Documents section ---
+    st.subheader("📚 View Stored Documents")
+    if st.checkbox("Show Stored Documents"):
+        data = get_all_data(collection)
+        if data['metadatas']:
+            titles = sorted(list(set([m['title'] for m in data['metadatas']])))
+            selected_title = st.selectbox("Select a Document to view:", options=titles)
 
-        fig = px.scatter(df, x="x", y="y", color="title", hover_data=["chunk", "text"])
-        st.plotly_chart(fig, use_container_width=True)
+            if selected_title:
+                filtered_docs = [
+                    (doc, meta) for doc, meta in zip(data['documents'], data['metadatas'])
+                    if meta['title'] == selected_title
+                ]
+                for doc, meta in filtered_docs:
+                    st.markdown(f"**Chunk {meta['chunk']}**")
+                    st.write(doc)
+        else:
+            st.warning("No documents have been uploaded yet.")
 
-        st.markdown("#### 🔍 Filter by Title to Search Within")
-        selected_doc = st.selectbox("Choose Title", options=list(set(df['title'])))
-        if selected_doc:
-            sub_docs = [(t, d) for t, d in zip(df['chunk'], df['text']) if d in df['text'] and t in df['chunk']]
-            for i, d in sub_docs:
-                st.markdown(f"**Chunk {i}**")
-                st.write(d)
+    # --- Cluster Visualization section ---
+    st.subheader("📊 Visualize Document Clusters")
+    if st.checkbox("Show Cluster Visualization"):
+        data = get_all_data(collection)
+        embeddings = data['embeddings']
+        metadatas = data['metadatas']
+        documents = data['documents']
+
+        if len(embeddings) < 2:
+            st.warning("Not enough data to visualize. Please upload more documents.")
+        else:
+            dim_reduce_method = st.radio("Dimensionality Reduction Method", ["PCA", "t-SNE"])
+            num_clusters = st.slider("Number of Clusters", min_value=2, max_value=10, value=5)
+
+            with st.spinner("Creating visualization..."):
+                reduced_coords = perform_dimensionality_reduction(embeddings, dim_reduce_method)
+                cluster_ids = cluster_embeddings(embeddings, num_clusters)
+
+                df = {
+                    "x": [c[0] for c in reduced_coords],
+                    "y": [c[1] for c in reduced_coords],
+                    "title": [m['title'] for m in metadatas],
+                    "chunk": [m['chunk'] for m in metadatas],
+                    "cluster": cluster_ids,
+                    "text": documents
+                }
+
+                fig = px.scatter(
+                    df,
+                    x="x",
+                    y="y",
+                    color="title",
+                    symbol="cluster",
+                    hover_data=["chunk", "text"],
+                    title="Document Embedding Clusters"
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+if __name__ == "__main__":
+    main()
